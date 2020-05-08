@@ -1,3 +1,9 @@
+config.log
+configure.log
+*.log
+*.log.*
+test/build/
+make/nb_native/nbproject/private/
 /build/
 /dist/
 /.idea/
