@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1997, 2018, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 1997, 2020, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -57,8 +57,8 @@
 #define PREF_AVG_LIST_LEN   2
 // 2^24 is max size
 #define END_SIZE           24
-// If a chain gets to 32 something might be wrong
-#define REHASH_LEN         32
+// If a chain gets to 100 something might be wrong
+#define REHASH_LEN         100
 // If we have as many dead items as 50% of the number of bucket
 #define CLEAN_DEAD_HIGH_WATER_MARK 0.5
 
@@ -68,11 +68,11 @@ bool StringTable::_shared_string_mapped = false;
 CompactHashtable<oop, char> StringTable::_shared_table;
 bool StringTable::_alt_hash = false;
 
-static juint murmur_seed = 0;
+static uint64_t _alt_hash_seed = 0;
 
 uintx hash_string(const jchar* s, int len, bool useAlt) {
   return  useAlt ?
-    AltHashing::murmur3_32(murmur_seed, s, len) :
+    AltHashing::halfsiphash_32(_alt_hash_seed, s, len) :
     java_lang_String::hash_code(s, len);
 }
 
@@ -558,8 +558,9 @@ bool StringTable::do_rehash() {
     return false;
   }
 
-  // We use max size
-  StringTableHash* new_table = new StringTableHash(END_SIZE, END_SIZE, REHASH_LEN);
+  // We use current size, not max size.
+  size_t new_size = _local_table->get_size_log2(Thread::current());
+  StringTableHash* new_table = new StringTableHash(new_size, END_SIZE, REHASH_LEN);
   // Use alt hash from now on
   _alt_hash = true;
   if (!_local_table->try_move_nodes_to(Thread::current(), new_table)) {
@@ -595,7 +596,7 @@ void StringTable::try_rehash_table() {
     return;
   }
 
-  murmur_seed = AltHashing::compute_seed();
+  _alt_hash_seed = AltHashing::compute_seed();
   {
     if (do_rehash()) {
       rehashed = true;
@@ -840,7 +841,7 @@ void StringTable::copy_shared_string_table(CompactStringTableWriter* writer) {
   assert(MetaspaceShared::is_heap_object_archiving_allowed(), "must be");
 
   CopyToArchive copy(writer);
-  StringTable::the_table()->_local_table->do_scan(Thread::current(), copy);
+  StringTable::the_table()->_local_table->do_safepoint_scan(copy);
 }
 
 void StringTable::write_to_archive() {

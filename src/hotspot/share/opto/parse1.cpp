@@ -671,7 +671,7 @@ void Parse::do_all_blocks() {
             // Need correct bci for predicate.
             // It is fine to set it here since do_one_block() will set it anyway.
             set_parse_bci(block->start());
-            add_predicate();
+            add_empty_predicates();
           }
           // Add new region for back branches.
           int edges = block->pred_count() - block->preds_parsed() + 1; // +1 for original region
@@ -1295,9 +1295,11 @@ void Parse::Block::init_graph(Parse* outer) {
     _successors[i] = block2;
 
     // Accumulate pred info for the other block, too.
-    if (i < ns) {
-      block2->_pred_count++;
-    } else {
+    // Note: We also need to set _pred_count for exception blocks since they could
+    // also have normal predecessors (reached without athrow by an explicit jump).
+    // This also means that next_path_num can be called along exception paths.
+    block2->_pred_count++;
+    if (i >= ns) {
       block2->_is_handler = true;
     }
 
@@ -1312,10 +1314,6 @@ void Parse::Block::init_graph(Parse* outer) {
     }
     #endif
   }
-
-  // Note: We never call next_path_num along exception paths, so they
-  // never get processed as "ready".  Also, the input phis of exception
-  // handlers get specially processed, so that
 }
 
 //---------------------------successor_for_bci---------------------------------
@@ -1656,7 +1654,7 @@ void Parse::merge_common(Parse::Block* target, int pnum) {
         if (target->start() == 0) {
           // Add loop predicate for the special case when
           // there are backbranches to the method entry.
-          add_predicate();
+          add_empty_predicates();
         }
       }
       // Add a Region to start the new basic block.  Phis will be added

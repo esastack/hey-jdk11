@@ -539,6 +539,15 @@ StringConcat* PhaseStringOpts::build_candidate(CallStaticJavaNode* call) {
                 cnode->method()->signature()->as_symbol() == int_sig)) {
       sc->add_control(cnode);
       Node* arg = cnode->in(TypeFunc::Parms + 1);
+      if (arg == NULL || arg->is_top()) {
+#ifndef PRODUCT
+        if (PrintOptimizeStringConcat) {
+          tty->print("giving up because the call is effectively dead");
+          cnode->jvms()->dump_spec(tty); tty->cr();
+        }
+#endif
+        break;
+      }
       if (cnode->method()->signature()->as_symbol() == int_sig) {
         sc->push_int(arg);
       } else if (cnode->method()->signature()->as_symbol() == char_sig) {
@@ -1200,7 +1209,7 @@ Node* PhaseStringOpts::int_stringSize(GraphKit& kit, Node* arg) {
     //     return i+1;
 
     // Add loop predicate first.
-    kit.add_predicate();
+    kit.add_empty_predicates();
 
     RegionNode *loop = new RegionNode(3);
     loop->init_req(1, kit.control());
@@ -1276,7 +1285,7 @@ void PhaseStringOpts::getChars(GraphKit& kit, Node* arg, Node* dst_array, BasicT
   // }
 
   // Add loop predicate first.
-  kit.add_predicate();
+  kit.add_empty_predicates();
 
   RegionNode* head = new RegionNode(3);
   head->init_req(1, kit.control());

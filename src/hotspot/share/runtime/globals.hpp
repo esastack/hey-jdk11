@@ -435,6 +435,9 @@ define_pd_global(uint64_t,MaxRAM,                    1ULL*G);
   product(bool, CriticalJNINatives, true,                                   \
           "Check for critical JNI entry points")                            \
                                                                             \
+  product(bool, UseLegacyJNINameEscaping, false,                            \
+          "Use the original JNI name escaping scheme")                      \
+                                                                            \
   notproduct(bool, StressCriticalJNINatives, false,                         \
           "Exercise register saving code in critical natives")              \
                                                                             \
@@ -2658,7 +2661,7 @@ define_pd_global(uint64_t,MaxRAM,                    1ULL*G);
   diagnostic(bool, ShowRegistersOnAssert, false,                            \
           "On internal errors, include registers in error report.")         \
                                                                             \
-  experimental(bool, UseSwitchProfiling, true,                              \
+  diagnostic(bool, UseSwitchProfiling, true,                                \
           "leverage profiling for table/lookup switch")                     \
                                                                             \
   JFR_ONLY(product(bool, FlightRecorder, false,                             \

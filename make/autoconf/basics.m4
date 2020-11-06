@@ -641,16 +641,17 @@ AC_DEFUN_ONCE([BASIC_SETUP_PATHS],
   AC_MSG_RESULT([$TOPDIR])
   AC_SUBST(TOPDIR)
 
+  # We can only call BASIC_FIXUP_PATH after BASIC_CHECK_PATHS_WINDOWS.
+  BASIC_FIXUP_PATH(CURDIR)
+  BASIC_FIXUP_PATH(TOPDIR)
+
   if test "x$CUSTOM_ROOT" != x; then
+    BASIC_FIXUP_PATH(CUSTOM_ROOT)
     WORKSPACE_ROOT="${CUSTOM_ROOT}"
   else
     WORKSPACE_ROOT="${TOPDIR}"
   fi
   AC_SUBST(WORKSPACE_ROOT)
-
-  # We can only call BASIC_FIXUP_PATH after BASIC_CHECK_PATHS_WINDOWS.
-  BASIC_FIXUP_PATH(CURDIR)
-  BASIC_FIXUP_PATH(TOPDIR)
 
   # Locate the directory of this script.
   AUTOCONF_DIR=$TOPDIR/make/autoconf
@@ -1231,12 +1232,25 @@ AC_DEFUN_ONCE([BASIC_SETUP_COMPLEX_TOOLS],
       AC_MSG_CHECKING([if codesign certificate is present])
       $RM codesign-testfile
       $TOUCH codesign-testfile
-      $CODESIGN -s "$MACOSX_CODESIGN_IDENTITY" codesign-testfile 2>&AS_MESSAGE_LOG_FD >&AS_MESSAGE_LOG_FD || CODESIGN=
+      $CODESIGN -s "$MACOSX_CODESIGN_IDENTITY" codesign-testfile 2>&AS_MESSAGE_LOG_FD \
+          >&AS_MESSAGE_LOG_FD || CODESIGN=
       $RM codesign-testfile
       if test "x$CODESIGN" = x; then
         AC_MSG_RESULT([no])
       else
         AC_MSG_RESULT([yes])
+        # Verify that the codesign has --option runtime
+        AC_MSG_CHECKING([if codesign has --option runtime])
+        $RM codesign-testfile
+        $TOUCH codesign-testfile
+        $CODESIGN --option runtime -s "$MACOSX_CODESIGN_IDENTITY" codesign-testfile \
+            2>&AS_MESSAGE_LOG_FD >&AS_MESSAGE_LOG_FD || CODESIGN=
+        $RM codesign-testfile
+        if test "x$CODESIGN" = x; then
+          AC_MSG_ERROR([codesign does not have --option runtime. macOS 10.13.6 and above is required.])
+        else
+          AC_MSG_RESULT([yes])
+        fi
       fi
     fi
     BASIC_REQUIRE_PROGS(SETFILE, SetFile)

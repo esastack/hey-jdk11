@@ -25,7 +25,7 @@
 
 # All valid JVM features, regardless of platform
 VALID_JVM_FEATURES="compiler1 compiler2 zero minimal dtrace jvmti jvmci \
-    graal vm-structs jni-check services management cmsgc epsilongc g1gc parallelgc serialgc zgc nmt cds \
+    graal vm-structs jni-check services management cmsgc epsilongc g1gc parallelgc serialgc shenandoahgc zgc nmt cds \
     static-build link-time-opt aot jfr"
 
 # Deprecated JVM features (these are ignored, but with a warning)
@@ -47,8 +47,8 @@ AC_DEFUN([HOTSPOT_CHECK_JVM_VARIANT],
 [ [ [[ " $JVM_VARIANTS " =~ " $1 " ]] ] ])
 
 ###############################################################################
-# Check if the specified JVM features are explicitly enabled. To be used in
-# shell if constructs, like this:
+# Check if the specified JVM feature is enabled. To be used in shell if
+# constructs, like this:
 # if HOTSPOT_CHECK_JVM_FEATURE(jvmti); then
 #
 # Only valid to use after HOTSPOT_SETUP_JVM_FEATURES has setup features.
@@ -57,6 +57,20 @@ AC_DEFUN([HOTSPOT_CHECK_JVM_VARIANT],
 # Additional [] needed to keep m4 from mangling shell constructs.
 AC_DEFUN([HOTSPOT_CHECK_JVM_FEATURE],
 [ [ [[ " $JVM_FEATURES " =~ " $1 " ]] ] ])
+
+###############################################################################
+# Check if the specified JVM feature is explicitly disabled. To be used in
+# shell if constructs, like this:
+# if HOTSPOT_IS_JVM_FEATURE_DISABLED(jvmci); then
+#
+# This function is internal to hotspot.m4, and is only used when constructing
+# the valid set of enabled JVM features. Users outside of hotspot.m4 should just
+# use HOTSPOT_CHECK_JVM_FEATURE to check if a feature is enabled or not.
+
+# Definition kept in one line to allow inlining in if statements.
+# Additional [] needed to keep m4 from mangling shell constructs.
+AC_DEFUN([HOTSPOT_IS_JVM_FEATURE_DISABLED],
+[ [ [[ " $DISABLED_JVM_FEATURES " =~ " $1 " ]] ] ])
 
 ###############################################################################
 # Check which variants of the JVM that we want to build. Available variants are:
@@ -338,6 +352,19 @@ AC_DEFUN_ONCE([HOTSPOT_SETUP_JVM_FEATURES],
     fi
   fi
 
+  # Only enable Shenandoah on supported arches, and only if requested
+  AC_MSG_CHECKING([if shenandoah can be built])
+  if HOTSPOT_CHECK_JVM_FEATURE(shenandoahgc); then
+    if test "x$OPENJDK_TARGET_CPU_ARCH" = "xx86" || test "x$OPENJDK_TARGET_CPU" = "xaarch64" ; then
+      AC_MSG_RESULT([yes])
+    else
+      DISABLED_JVM_FEATURES="$DISABLED_JVM_FEATURES shenandoahgc"
+      AC_MSG_RESULT([no, platform not supported])
+    fi
+  else
+      DISABLED_JVM_FEATURES="$DISABLED_JVM_FEATURES shenandoahgc"
+  fi
+
   # Only enable ZGC on supported platforms
   AC_MSG_CHECKING([if zgc can be built])
   if test "x$OPENJDK_TARGET_OS" = "xlinux" && test "x$OPENJDK_TARGET_CPU" = "xx86_64"; then
@@ -349,7 +376,7 @@ AC_DEFUN_ONCE([HOTSPOT_SETUP_JVM_FEATURES],
 
   # Disable unsupported GCs for Zero
   if HOTSPOT_CHECK_JVM_VARIANT(zero); then
-    DISABLED_JVM_FEATURES="$DISABLED_JVM_FEATURES epsilongc g1gc zgc"
+    DISABLED_JVM_FEATURES="$DISABLED_JVM_FEATURES epsilongc g1gc shenandoahgc zgc"
   fi
 
   # Turn on additional features based on other parts of configure
@@ -377,8 +404,7 @@ AC_DEFUN_ONCE([HOTSPOT_SETUP_JVM_FEATURES],
 
   AC_MSG_CHECKING([if jvmci module jdk.internal.vm.ci should be built])
   # Check if jvmci is diabled
-  DISABLE_JVMCI=`$ECHO $DISABLED_JVM_FEATURES | $GREP jvmci`
-  if test "x$DISABLE_JVMCI" = "xjvmci"; then
+  if HOTSPOT_IS_JVM_FEATURE_DISABLED(jvmci); then
     AC_MSG_RESULT([no, forced])
     JVM_FEATURES_jvmci=""
     INCLUDE_JVMCI="false"
@@ -404,8 +430,7 @@ AC_DEFUN_ONCE([HOTSPOT_SETUP_JVM_FEATURES],
 
   AC_MSG_CHECKING([if graal module jdk.internal.vm.compiler should be built])
   # Check if graal is diabled
-  DISABLE_GRAAL=`$ECHO $DISABLED_JVM_FEATURES | $GREP graal`
-  if test "x$DISABLE_GRAAL" = "xgraal"; then
+  if HOTSPOT_IS_JVM_FEATURE_DISABLED(graal); then
     AC_MSG_RESULT([no, forced])
     JVM_FEATURES_graal=""
     INCLUDE_GRAAL="false"
@@ -437,8 +462,7 @@ AC_DEFUN_ONCE([HOTSPOT_SETUP_JVM_FEATURES],
   AC_SUBST(INCLUDE_GRAAL)
 
   # Disable aot with '--with-jvm-features=-aot'
-  DISABLE_AOT=`$ECHO $DISABLED_JVM_FEATURES | $GREP aot`
-  if test "x$DISABLE_AOT" = "xaot"; then
+  if HOTSPOT_IS_JVM_FEATURE_DISABLED(aot); then
     ENABLE_AOT="false"
   fi
 
@@ -462,7 +486,7 @@ AC_DEFUN_ONCE([HOTSPOT_SETUP_JVM_FEATURES],
       JVM_FEATURES_aot="aot"
     fi
   else
-    if test "x$enable_aot" = "xno" || test "x$DISABLE_AOT" = "xaot"; then
+    if test "x$enable_aot" = "xno" || HOTSPOT_IS_JVM_FEATURE_DISABLED(aot); then
       AC_MSG_RESULT([no, forced])
     else
       AC_MSG_RESULT([no])
@@ -483,7 +507,7 @@ AC_DEFUN_ONCE([HOTSPOT_SETUP_JVM_FEATURES],
   fi
 
   # All variants but minimal (and custom) get these features
-  NON_MINIMAL_FEATURES="$NON_MINIMAL_FEATURES cmsgc g1gc parallelgc serialgc epsilongc jni-check jvmti management nmt services vm-structs zgc"
+  NON_MINIMAL_FEATURES="$NON_MINIMAL_FEATURES cmsgc g1gc parallelgc serialgc epsilongc shenandoahgc jni-check jvmti management nmt services vm-structs zgc"
 
   AC_MSG_CHECKING([if cds should be enabled])
   if test "x$ENABLE_CDS" = "xtrue"; then

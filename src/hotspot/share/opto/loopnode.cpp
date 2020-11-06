@@ -40,6 +40,10 @@
 #include "opto/mulnode.hpp"
 #include "opto/rootnode.hpp"
 #include "opto/superword.hpp"
+#include "utilities/macros.hpp"
+#if INCLUDE_SHENANDOAHGC
+#include "gc/shenandoah/c2/shenandoahBarrierSetC2.hpp"
+#endif
 
 //=============================================================================
 //------------------------------is_loop_iv-------------------------------------
@@ -948,17 +952,21 @@ Node *LoopNode::Ideal(PhaseGVN *phase, bool can_reshape) {
   return RegionNode::Ideal(phase, can_reshape);
 }
 
-void LoopNode::verify_strip_mined(int expect_skeleton) const {
 #ifdef ASSERT
+void LoopNode::verify_strip_mined(int expect_skeleton) const {
   const OuterStripMinedLoopNode* outer = NULL;
   const CountedLoopNode* inner = NULL;
   if (is_strip_mined()) {
+    if (!is_valid_counted_loop()) {
+      return; // Skip malformed counted loop
+    }
     assert(is_CountedLoop(), "no Loop should be marked strip mined");
     inner = as_CountedLoop();
     outer = inner->in(LoopNode::EntryControl)->as_OuterStripMinedLoop();
   } else if (is_OuterStripMinedLoop()) {
     outer = this->as_OuterStripMinedLoop();
     inner = outer->unique_ctrl_out()->as_CountedLoop();
+    assert(inner->is_valid_counted_loop() && inner->is_strip_mined(), "OuterStripMinedLoop should have been removed");
     assert(!is_strip_mined(), "outer loop shouldn't be marked strip mined");
   }
   if (inner != NULL || outer != NULL) {
@@ -1027,8 +1035,8 @@ void LoopNode::verify_strip_mined(int expect_skeleton) const {
     assert(sfpt->outcnt() == 1, "no data node");
     assert(outer_tail->outcnt() == 1 || !has_skeleton, "no data node");
   }
-#endif
 }
+#endif
 
 //=============================================================================
 //------------------------------Ideal------------------------------------------
@@ -1239,7 +1247,7 @@ Node* CountedLoopNode::match_incr_with_optional_truncation(
 }
 
 LoopNode* CountedLoopNode::skip_strip_mined(int expect_skeleton) {
-  if (is_strip_mined()) {
+  if (is_strip_mined() && is_valid_counted_loop()) {
     verify_strip_mined(expect_skeleton);
     return in(EntryControl)->as_Loop();
   }
@@ -2088,10 +2096,18 @@ bool IdealLoopTree::beautify_loops( PhaseIdealLoop *phase ) {
   // If I am a shared header (multiple backedges), peel off the many
   // backedges into a private merge point and use the merge point as
   // the one true backedge.
-  if( _head->req() > 3 ) {
+  if (_head->req() > 3) {
     // Merge the many backedges into a single backedge but leave
     // the hottest backedge as separate edge for the following peel.
-    merge_many_backedges( phase );
+    if (!_irreducible) {
+      merge_many_backedges( phase );
+    }
+
+    // When recursively beautify my children, split_fall_in can change
+    // loop tree structure when I am an irreducible loop. Then the head
+    // of my children has a req() not bigger than 3. Here we need to set
+    // result to true to catch that case in order to tell the caller to
+    // rebuild loop tree. See issue JDK-8244407 for details.
     result = true;
   }
 
@@ -2457,17 +2473,17 @@ void IdealLoopTree::dump_head( ) const {
     tty->print(" limit_check");
     entry = PhaseIdealLoop::skip_loop_predicates(entry);
   }
-  if (UseLoopPredicate) {
-    entry = PhaseIdealLoop::find_predicate_insertion_point(entry, Deoptimization::Reason_predicate);
-    if (entry != NULL) {
-      tty->print(" predicated");
+  if (UseProfiledLoopPredicate) {
+    predicate = PhaseIdealLoop::find_predicate_insertion_point(entry, Deoptimization::Reason_profile_predicate);
+    if (predicate != NULL) {
+      tty->print(" profile_predicated");
       entry = PhaseIdealLoop::skip_loop_predicates(entry);
     }
   }
-  if (UseProfiledLoopPredicate) {
-    entry = PhaseIdealLoop::find_predicate_insertion_point(entry, Deoptimization::Reason_profile_predicate);
-    if (entry != NULL) {
-      tty->print(" profile_predicated");
+  if (UseLoopPredicate) {
+    predicate = PhaseIdealLoop::find_predicate_insertion_point(entry, Deoptimization::Reason_predicate);
+    if (predicate != NULL) {
+      tty->print(" predicated");
     }
   }
   if (_head->is_CountedLoop()) {
@@ -2572,21 +2588,21 @@ void PhaseIdealLoop::collect_potentially_useful_predicates(
     LoopNode* lpn = loop->_head->as_Loop();
     Node* entry = lpn->in(LoopNode::EntryControl);
     Node* predicate_proj = find_predicate(entry); // loop_limit_check first
-    if (predicate_proj != NULL ) { // right pattern that can be used by loop predication
+    if (predicate_proj != NULL) { // right pattern that can be used by loop predication
       assert(entry->in(0)->in(1)->in(1)->Opcode() == Op_Opaque1, "must be");
-      useful_predicates.push(entry->in(0)->in(1)->in(1)); // good one
-      entry = skip_loop_predicates(entry);
-    }
-    predicate_proj = find_predicate(entry); // Predicate
-    if (predicate_proj != NULL ) {
       useful_predicates.push(entry->in(0)->in(1)->in(1)); // good one
       entry = skip_loop_predicates(entry);
     }
     if (UseProfiledLoopPredicate) {
       predicate_proj = find_predicate(entry); // Predicate
-      if (predicate_proj != NULL ) {
+      if (predicate_proj != NULL) {
         useful_predicates.push(entry->in(0)->in(1)->in(1)); // good one
+        entry = skip_loop_predicates(entry);
       }
+    }
+    predicate_proj = find_predicate(entry); // Predicate
+    if (predicate_proj != NULL) {
+      useful_predicates.push(entry->in(0)->in(1)->in(1)); // good one
     }
   }
 
@@ -2716,6 +2732,10 @@ bool PhaseIdealLoop::process_expensive_nodes() {
 void PhaseIdealLoop::build_and_optimize(LoopOptsMode mode) {
   bool do_split_ifs = (mode == LoopOptsDefault || mode == LoopOptsLastRound);
   bool skip_loop_opts = (mode == LoopOptsNone);
+#if INCLUDE_SHENANDOAHGC
+  bool shenandoah_opts = (mode == LoopOptsShenandoahExpand ||
+                          mode == LoopOptsShenandoahPostExpand);
+#endif
 
   ResourceMark rm;
 
@@ -2780,7 +2800,7 @@ void PhaseIdealLoop::build_and_optimize(LoopOptsMode mode) {
   }
 
   // Nothing to do, so get out
-  bool stop_early = !C->has_loops() && !skip_loop_opts && !do_split_ifs && !_verify_me && !_verify_only;
+  bool stop_early = !C->has_loops() && !skip_loop_opts && !do_split_ifs && !_verify_me && !_verify_only SHENANDOAHGC_ONLY(&& !shenandoah_opts);
   bool do_expensive_nodes = C->should_optimize_expensive_nodes(_igvn);
   if (stop_early && !do_expensive_nodes) {
     _igvn.optimize();           // Cleanup NeverBranches
@@ -2859,7 +2879,7 @@ void PhaseIdealLoop::build_and_optimize(LoopOptsMode mode) {
 
   // Given early legal placement, try finding counted loops.  This placement
   // is good enough to discover most loop invariants.
-  if( !_verify_me && !_verify_only )
+  if( !_verify_me && !_verify_only SHENANDOAHGC_ONLY(&& !shenandoah_opts))
     _ltree_root->counted_loop( this );
 
   // Find latest loop placement.  Find ideal loop placement.
@@ -2930,6 +2950,16 @@ void PhaseIdealLoop::build_and_optimize(LoopOptsMode mode) {
     }
     return;
   }
+
+#if INCLUDE_SHENANDOAHGC
+  if (UseShenandoahGC && ((ShenandoahBarrierSetC2*) BarrierSet::barrier_set()->barrier_set_c2())->optimize_loops(this, mode, visited, nstack, worklist)) {
+    _igvn.optimize();
+    if (C->log() != NULL) {
+      log_loop_tree(_ltree_root, _ltree_root, C->log());
+    }
+    return;
+  }
+#endif
 
   if (ReassociateInvariants) {
     // Reassociate invariants and prep for split_thru_phi
@@ -3584,7 +3614,7 @@ int PhaseIdealLoop::build_loop_tree_impl( Node *n, int pre_order ) {
           Node *frame = new ParmNode( C->start(), TypeFunc::FramePtr );
           _igvn.register_new_node_with_optimizer(frame);
           // Halt & Catch Fire
-          Node *halt = new HaltNode( if_f, frame );
+          Node* halt = new HaltNode(if_f, frame, "never-taken loop exit reached");
           _igvn.register_new_node_with_optimizer(halt);
           set_loop(halt, l);
           C->root()->add_req(halt);
@@ -3952,27 +3982,32 @@ Node *PhaseIdealLoop::get_late_ctrl( Node *n, Node *early ) {
   // dominated by early is considered a potentially interfering store.
   // This can produce false positives.
   if (n->is_Load() && LCA != early) {
-    Node_List worklist;
+    int load_alias_idx = C->get_alias_index(n->adr_type());
+    if (C->alias_type(load_alias_idx)->is_rewritable()) {
 
-    Node *mem = n->in(MemNode::Memory);
-    for (DUIterator_Fast imax, i = mem->fast_outs(imax); i < imax; i++) {
-      Node* s = mem->fast_out(i);
-      worklist.push(s);
-    }
-    while(worklist.size() != 0 && LCA != early) {
-      Node* s = worklist.pop();
-      if (s->is_Load() || s->Opcode() == Op_SafePoint) {
-        continue;
-      } else if (s->is_MergeMem()) {
-        for (DUIterator_Fast imax, i = s->fast_outs(imax); i < imax; i++) {
-          Node* s1 = s->fast_out(i);
-          worklist.push(s1);
-        }
-      } else {
-        Node *sctrl = has_ctrl(s) ? get_ctrl(s) : s->in(0);
-        assert(sctrl != NULL || s->outcnt() == 0, "must have control");
-        if (sctrl != NULL && !sctrl->is_top() && is_dominator(early, sctrl)) {
-          LCA = dom_lca_for_get_late_ctrl(LCA, sctrl, n);
+      Node_List worklist;
+
+      Node *mem = n->in(MemNode::Memory);
+      for (DUIterator_Fast imax, i = mem->fast_outs(imax); i < imax; i++) {
+        Node* s = mem->fast_out(i);
+        worklist.push(s);
+      }
+      while(worklist.size() != 0 && LCA != early) {
+        Node* s = worklist.pop();
+        if (s->is_Load() || s->Opcode() == Op_SafePoint ||
+            (s->is_CallStaticJava() && s->as_CallStaticJava()->uncommon_trap_request() != 0)) {
+          continue;
+        } else if (s->is_MergeMem()) {
+          for (DUIterator_Fast imax, i = s->fast_outs(imax); i < imax; i++) {
+            Node* s1 = s->fast_out(i);
+            worklist.push(s1);
+          }
+        } else {
+          Node *sctrl = has_ctrl(s) ? get_ctrl(s) : s->in(0);
+          assert(sctrl != NULL || s->outcnt() == 0, "must have control");
+          if (sctrl != NULL && !sctrl->is_top() && C->can_alias(s->adr_type(), load_alias_idx) && is_dominator(early, sctrl)) {
+            LCA = dom_lca_for_get_late_ctrl(LCA, sctrl, n);
+          }
         }
       }
     }
@@ -4149,7 +4184,12 @@ void PhaseIdealLoop::verify_strip_mined_scheduling(Node *n, Node* least) {
   }
   IdealLoopTree* loop = get_loop(least);
   Node* head = loop->_head;
-  if (head->is_OuterStripMinedLoop()) {
+  if (head->is_OuterStripMinedLoop()
+#if INCLUDE_SHENANDOAHGC
+      && // Verification can't be applied to fully built strip mined loops
+      head->as_Loop()->outer_loop_end()->in(1)->find_int_con(-1) == 0
+#endif
+      ) {
     Node* sfpt = head->as_Loop()->outer_safepoint();
     ResourceMark rm;
     Unique_Node_List wq;
@@ -4229,6 +4269,11 @@ void PhaseIdealLoop::build_loop_late_post( Node *n ) {
     case Op_HasNegatives:
       pinned = false;
     }
+#if INCLUDE_SHENANDOAHGC
+    if (UseShenandoahGC && n->is_CMove()) {
+      pinned = false;
+    }
+#endif
     if( pinned ) {
       IdealLoopTree *chosen_loop = get_loop(n->is_CFG() ? n : get_ctrl(n));
       if( !chosen_loop->_child )       // Inner loop?
@@ -4493,7 +4538,9 @@ void PhaseIdealLoop::dump( IdealLoopTree *loop, uint idx, Node_List &rpo_list ) 
     }
   }
 }
+#endif
 
+#if !defined(PRODUCT) || INCLUDE_SHENANDOAHGC
 // Collect a R-P-O for the whole CFG.
 // Result list is in post-order (scan backwards for RPO)
 void PhaseIdealLoop::rpo( Node *start, Node_Stack &stk, VectorSet &visited, Node_List &rpo_list ) const {

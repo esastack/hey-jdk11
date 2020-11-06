@@ -96,6 +96,10 @@ enum LoopOptsMode {
   LoopOptsSkipSplitIf,
   LoopOptsVerify,
   LoopOptsLastRound
+#if INCLUDE_SHENANDOAHGC
+  ,LoopOptsShenandoahExpand,
+   LoopOptsShenandoahPostExpand
+#endif
 };
 
 typedef unsigned int node_idx_t;
@@ -1096,6 +1100,7 @@ class Compile : public Phase {
   void inline_string_calls(bool parse_time);
   void inline_boxing_calls(PhaseIterGVN& igvn);
   bool optimize_loops(int& loop_opts_cnt, PhaseIterGVN& igvn, LoopOptsMode mode);
+  void remove_root_to_sfpts_edges(PhaseIterGVN& igvn);
 
   // Matching, CFG layout, allocation, code generation
   PhaseCFG*         cfg()                       { return _cfg; }
@@ -1372,6 +1377,9 @@ class Compile : public Phase {
   void          set_clone_map(Dict* d);
 
   bool is_compiling_clinit_for(ciKlass* k);
+#ifdef ASSERT
+  bool _type_verify_symmetry;
+#endif
 };
 
 #endif // SHARE_VM_OPTO_COMPILE_HPP

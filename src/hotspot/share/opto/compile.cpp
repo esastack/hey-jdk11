@@ -82,6 +82,9 @@
 #if INCLUDE_ZGC
 #include "gc/z/c2/zBarrierSetC2.hpp"
 #endif
+#if INCLUDE_SHENANDOAHGC
+#include "gc/shenandoah/c2/shenandoahBarrierSetC2.hpp"
+#endif
 
 
 // -------------------- Compile::mach_constant_base_node -----------------------
@@ -1195,6 +1198,9 @@ void Compile::Init(int aliaslevel) {
   _range_check_casts = new(comp_arena()) GrowableArray<Node*>(comp_arena(), 8,  0, NULL);
   _opaque4_nodes = new(comp_arena()) GrowableArray<Node*>(comp_arena(), 8,  0, NULL);
   register_library_intrinsics();
+#ifdef ASSERT
+  _type_verify_symmetry = true;
+#endif
 }
 
 //---------------------------init_start----------------------------------------
@@ -2170,6 +2176,31 @@ bool Compile::optimize_loops(int& loop_opts_cnt, PhaseIterGVN& igvn, LoopOptsMod
   return true;
 }
 
+// Remove edges from "root" to each SafePoint at a backward branch.
+// They were inserted during parsing (see add_safepoint()) to make
+// infinite loops without calls or exceptions visible to root, i.e.,
+// useful.
+void Compile::remove_root_to_sfpts_edges(PhaseIterGVN& igvn) {
+  Node *r = root();
+  if (r != NULL) {
+    for (uint i = r->req(); i < r->len(); ++i) {
+      Node *n = r->in(i);
+      if (n != NULL && n->is_SafePoint()) {
+        r->rm_prec(i);
+        if (n->outcnt() == 0) {
+          igvn.remove_dead_node(n);
+        }
+        --i;
+      }
+    }
+    // Parsing may have added top inputs to the root node (Path
+    // leading to the Halt node proven dead). Make sure we get a
+    // chance to clean them up.
+    igvn._worklist.push(r);
+    igvn.optimize();
+  }
+}
+
 //------------------------------Optimize---------------------------------------
 // Given a graph, optimize it.
 void Compile::Optimize() {
@@ -2230,6 +2261,10 @@ void Compile::Optimize() {
 
     if (failing())  return;
   }
+
+  // Now that all inlining is over, cut edge from root to loop
+  // safepoints
+  remove_root_to_sfpts_edges(igvn);
 
   // Remove the speculative part of types and clean up the graph from
   // the extra CastPP nodes whose only purpose is to carry them. Do
@@ -2389,6 +2424,16 @@ void Compile::Optimize() {
       return;
     }
   }
+
+#if INCLUDE_SHENANDOAHGC
+  if (UseShenandoahGC) {
+    print_method(PHASE_BEFORE_BARRIER_EXPAND, 2);
+    if (((ShenandoahBarrierSetC2*)BarrierSet::barrier_set()->barrier_set_c2())->expand_barriers(this, igvn)) {
+      assert(failing(), "must bail out w/ explicit message");
+      return;
+    }
+  }
+#endif
 
   if (opaque4_count() > 0) {
     C->remove_opaque4_nodes(igvn);
@@ -2830,6 +2875,17 @@ void Compile::final_graph_reshaping_impl( Node *n, Final_Reshape_Counts &frc) {
   case Op_CallLeafNoFP: {
     assert (n->is_Call(), "");
     CallNode *call = n->as_Call();
+#if INCLUDE_SHENANDOAHGC
+    if (UseShenandoahGC && ShenandoahBarrierSetC2::is_shenandoah_wb_pre_call(call)) {
+      uint cnt = ShenandoahBarrierSetC2::write_ref_field_pre_entry_Type()->domain()->cnt();
+      if (call->req() > cnt) {
+        assert(call->req() == cnt+1, "only one extra input");
+        Node* addp = call->in(cnt);
+        assert(!ShenandoahBarrierSetC2::has_only_shenandoah_wb_pre_uses(addp), "useless address computation?");
+        call->del_req(cnt);
+      }
+    }
+#endif
     // Count call sites where the FP mode bit would have to be flipped.
     // Do not count uncommon runtime calls:
     // uncommon_trap, _complete_monitor_locking, _complete_monitor_unlocking,
@@ -3219,8 +3275,10 @@ void Compile::final_graph_reshaping_impl( Node *n, Final_Reshape_Counts &frc) {
             break;
           }
         }
-        assert(proj != NULL, "must be found");
-        p->subsume_by(proj, this);
+        assert(proj != NULL || p->_con == TypeFunc::I_O, "io may be dropped at an infinite loop");
+        if (proj != NULL) {
+          p->subsume_by(proj, this);
+        }
       }
     }
     break;
@@ -3394,6 +3452,28 @@ void Compile::final_graph_reshaping_impl( Node *n, Final_Reshape_Counts &frc) {
     }
     break;
   }
+#if INCLUDE_SHENANDOAHGC
+  case Op_ShenandoahCompareAndSwapP:
+  case Op_ShenandoahCompareAndSwapN:
+  case Op_ShenandoahWeakCompareAndSwapN:
+  case Op_ShenandoahWeakCompareAndSwapP:
+  case Op_ShenandoahCompareAndExchangeP:
+  case Op_ShenandoahCompareAndExchangeN:
+#ifdef ASSERT
+    if( VerifyOptoOopOffsets ) {
+      MemNode* mem  = n->as_Mem();
+      // Check to see if address types have grounded out somehow.
+      const TypeInstPtr *tp = mem->in(MemNode::Address)->bottom_type()->isa_instptr();
+      ciInstanceKlass *k = tp->klass()->as_instance_klass();
+      bool oop_offset_is_sane = k->contains_field_offset(tp->offset());
+      assert( !tp || oop_offset_is_sane, "" );
+    }
+#endif
+     break;
+  case Op_ShenandoahLoadReferenceBarrier:
+    assert(false, "should have been expanded already");
+    break;
+#endif
   case Op_RangeCheck: {
     RangeCheckNode* rc = n->as_RangeCheck();
     Node* iff = new IfNode(rc->in(0), rc->in(1), rc->_prob, rc->_fcnt);
@@ -3830,10 +3910,18 @@ void Compile::verify_graph_edges(bool no_dead_code) {
 // Currently supported:
 // - G1 pre-barriers (see GraphKit::g1_write_barrier_pre())
 void Compile::verify_barriers() {
-#if INCLUDE_G1GC
-  if (UseG1GC) {
+#if INCLUDE_G1GC || INCLUDE_SHENANDOAHGC
+  if (UseG1GC SHENANDOAHGC_ONLY(|| UseShenandoahGC)) {
     // Verify G1 pre-barriers
+
+#if INCLUDE_G1GC && INCLUDE_SHENANDOAHGC
+    const int marking_offset = in_bytes(UseG1GC ? G1ThreadLocalData::satb_mark_queue_active_offset()
+                                                : ShenandoahThreadLocalData::satb_mark_queue_active_offset());
+#elif INCLUDE_G1GC
     const int marking_offset = in_bytes(G1ThreadLocalData::satb_mark_queue_active_offset());
+#else
+    const int marking_offset = in_bytes(ShenandoahThreadLocalData::satb_mark_queue_active_offset());
+#endif
 
     ResourceArea *area = Thread::current()->resource_area();
     Unique_Node_List visited(area);

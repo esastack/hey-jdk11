@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2011, 2018, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2011, 2020, Oracle and/or its affiliates. All rights reserved.
 # DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
 #
 # This code is free software; you can redistribute it and/or modify it
@@ -24,6 +24,7 @@
 #
 
 include JdkNativeCompilation.gmk
+include TextFileProcessing.gmk
 
 ORIGIN_ARG := $(call SET_EXECUTABLE_ORIGIN,/../lib/jli)
 
@@ -118,14 +119,25 @@ define SetupBuildLauncherBody
   $1_LIBS :=
   ifeq ($(OPENJDK_TARGET_OS), macosx)
     ifeq ($$($1_MACOSX_PRIVILEGED), true)
-      $1_PLIST_FILE := Info-privileged.plist
+      $1_PLIST_SRC_FILE := Info-privileged.plist
     else
-      $1_PLIST_FILE := Info-cmdline.plist
+      $1_PLIST_SRC_FILE := Info-cmdline.plist
     endif
 
     $1_CFLAGS += -DPACKAGE_PATH='"$(PACKAGE_PATH)"'
-    $1_LDFLAGS += -Wl,-all_load \
-        -sectcreate __TEXT __info_plist $(MACOSX_PLIST_DIR)/$$($1_PLIST_FILE)
+
+    $1_PLIST_FILE := $$(SUPPORT_OUTPUTDIR)/native/$$(MODULE)/$1/Info.plist
+
+    $$(eval $$(call SetupTextFileProcessing, BUILD_PLIST_$1, \
+        SOURCE_FILES := $$(TOPDIR)/src/java.base/macosx/native/launcher/$$($1_PLIST_SRC_FILE), \
+        OUTPUT_FILE := $$($1_PLIST_FILE), \
+        REPLACEMENTS := \
+            @@ID@@ => $(MACOSX_BUNDLE_ID_BASE).$(VERSION_SHORT).$1 ; \
+            @@VERSION@@ => $(VERSION_NUMBER) ; \
+    ))
+
+    $1_LDFLAGS += -Wl,-all_load -sectcreate __TEXT __info_plist $$($1_PLIST_FILE)
+
     ifeq ($(STATIC_BUILD), true)
       $1_LDFLAGS += -exported_symbols_list \
               $(SUPPORT_OUTPUTDIR)/build-static/exported.symbols
@@ -159,12 +171,12 @@ define SetupBuildLauncherBody
       EXTRA_FILES := $(LAUNCHER_SRC)/main.c, \
       OPTIMIZATION := $$($1_OPTIMIZATION), \
       CFLAGS := $$(CFLAGS_JDKEXE) $$($1_CFLAGS) \
-          $(LAUNCHER_CFLAGS) \
-          $(VERSION_CFLAGS) \
-          -DLAUNCHER_NAME='"$(LAUNCHER_NAME)"' \
+          $$(LAUNCHER_CFLAGS) \
+          $$(VERSION_CFLAGS) \
+          -DLAUNCHER_NAME='"$$(LAUNCHER_NAME)"' \
           -DPROGNAME='"$1"' \
           $$($1_CFLAGS), \
-      CFLAGS_solaris := -KPIC -DHAVE_GETHRTIME, \
+      CFLAGS_solaris := -KPIC, \
       CFLAGS_windows := $$($1_CFLAGS_windows), \
       LDFLAGS := $$(LDFLAGS_JDKEXE) \
           $$(ORIGIN_ARG) \
@@ -192,6 +204,8 @@ define SetupBuildLauncherBody
 
   $1 += $$(BUILD_LAUNCHER_$1)
   TARGETS += $$($1)
+
+  $$(BUILD_LAUNCHER_$1): $$(BUILD_PLIST_$1)
 
   ifeq ($(OPENJDK_TARGET_OS), aix)
     $$(BUILD_LAUNCHER_$1): $(call FindStaticLib, java.base, jli_static)
